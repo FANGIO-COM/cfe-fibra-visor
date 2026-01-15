@@ -283,7 +283,7 @@ export function MapView() {
         style={{
           position: "absolute",
           top: 16,
-          left: 16,
+          left: 50,
           zIndex: 1000,
         }}
       >
@@ -294,8 +294,8 @@ export function MapView() {
       <div
         style={{
           position: "absolute",
-          top: 16,
-          right: 16,
+          top: 160,
+          right: 20,
           zIndex: 1000,
         }}
       >
@@ -313,7 +313,7 @@ export function MapView() {
       <div
         style={{
           position: "absolute",
-          bottom: 16,
+          bottom: 50,
           left: 16,
           zIndex: 1000,
         }}
