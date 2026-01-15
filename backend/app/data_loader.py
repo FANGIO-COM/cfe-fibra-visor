@@ -6,6 +6,9 @@ import math
 import geopandas as gpd
 import pandas as pd
 from pyproj import Geod
+import tempfile
+import uuid
+import shutil
 
 from .config import (
     FIBRA_SHP,
@@ -82,7 +85,7 @@ def to_wgs84(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     return gdf.to_crs(epsg=4326)
 
 
-def km_lengths(gdf: gpd.GeoDataFrame) -> pd.Series:
+def km_lengths(gdf):
     """
     Calcula la longitud en km de cada geometría sin depender de .length ni de CRS.
 
@@ -90,77 +93,29 @@ def km_lengths(gdf: gpd.GeoDataFrame) -> pd.Series:
     - Si las coordenadas parecen grados (lon/lat), usa cálculo geodésico WGS84.
     - Si NO parecen grados, asume que las unidades son metros y usa distancia euclidiana.
     """
-    geod = Geod(ellps="WGS84")
 
-    # Buscar una geometría de ejemplo no vacía
-    sample_geom = next(
-        (g for g in gdf.geometry if g is not None and not g.is_empty),
-        None,
-    )
-    if sample_geom is None:
-        # No hay geometrías válidas
-        return pd.Series([0.0] * len(gdf), index=gdf.index)
+    if gdf.crs is None:
+        gdf = gdf.set_crs(epsg=3857)  # tu data real viene en 3857
 
-    coords0 = list(sample_geom.coords)
-    if not coords0:
-        return pd.Series([0.0] * len(gdf), index=gdf.index)
+    g4326 = gdf.to_crs(epsg=4326)
+    crs_metric = g4326.estimate_utm_crs()
+    gm = g4326.to_crs(crs_metric)
 
-    # Tomamos el primer punto y vemos si parece lon/lat (en grados)
-    x0, y0 = float(coords0[0][0]), float(coords0[0][1])
-    is_degrees = (abs(x0) <= 180 and abs(y0) <= 90)
-
-    def length_geom(geom) -> float:
-        if geom is None or geom.is_empty:
-            return 0.0
-
-        total_m = 0.0
-
-        def acumula_segmentos(coords):
-            nonlocal total_m
-            if len(coords) < 2:
-                return
-            for p1, p2 in zip(coords[:-1], coords[1:]):
-                # Las coords pueden ser (x, y), (x, y, z) o (x, y, z, m)
-                x1, y1 = float(p1[0]), float(p1[1])
-                x2, y2 = float(p2[0]), float(p2[1])
-
-                if not all(math.isfinite(v) for v in (x1, y1, x2, y2)):
-                    continue
-
-                if is_degrees:
-                    # Tratamos las coords como lon/lat en grados (distancia geodésica)
-                    _, _, dist_m = geod.inv(x1, y1, x2, y2)
-                else:
-                    # Tratamos las coords como metros en un plano
-                    dx, dy = x2 - x1, y2 - y1
-                    dist_m = math.hypot(dx, dy)
-
-                if math.isfinite(dist_m):
-                    total_m += dist_m
-
-        if geom.geom_type in ("LineString", "LinearRing"):
-            acumula_segmentos(list(geom.coords))
-        elif geom.geom_type == "MultiLineString":
-            for part in geom.geoms:
-                acumula_segmentos(list(part.coords))
-        else:
-            # Si hay polígonos u otras cosas raras, las ignoramos para longitud de fibra
-            pass
-
-        return round(total_m / 1000.0, 3)
-
-    lengths = [length_geom(geom) for geom in gdf.geometry]
-    return pd.Series(lengths, index=gdf.index)
-
+    return (gm.length / 1000.0).round(3)
 
 def load_points_from_zip(zip_path, base_name):
     """
-    Extrae un shapefile de puntos desde un ZIP y lo devuelve reproyectado a WGS84.
+    Extrae un shapefile desde un ZIP en una carpeta TEMP única (evita locks/permissions)
+    y lo devuelve reproyectado a WGS84.
     """
     if not os.path.exists(zip_path):
         return None
 
-    extract_dir = os.path.splitext(str(zip_path))[0] + "_extracted"
+    # Extract into a NEW unique temp directory every run
+    extract_dir = os.path.join(
+        tempfile.gettempdir(),
+        f"{os.path.splitext(os.path.basename(zip_path))[0]}_{uuid.uuid4().hex}"
+    )
     os.makedirs(extract_dir, exist_ok=True)
 
     with zipfile.ZipFile(zip_path, "r") as z:
@@ -192,8 +147,8 @@ def load_base_data():
         raise FileNotFoundError(f"No se encontró {FIBRA_SHP}")
 
     gdf = gpd.read_file(FIBRA_SHP)
-    if gdf.empty:
-        raise ValueError(f"Shapefile vacío: {FIBRA_SHP}")
+    if gdf.crs is None:
+        gdf = gdf.set_crs(epsg=3857)
 
     # En este punto NO tocamos gdf.crs; km_lengths se encarga de decidir
     # si trata las coords como grados o como metros.
@@ -209,6 +164,7 @@ def load_base_data():
     gdf["long_km"] = km_lengths(gdf)
     print("Ejemplo long_km:")
     print(gdf[["long_km"]].head())
+
 
     gdf["estado"] = (
         normalize_estado(gdf[estado_col]) if estado_col else "construido"
@@ -226,6 +182,8 @@ def load_base_data():
         gdf_wgs["geometry"] = gdf_wgs.geometry.simplify(
             SIMPLIFY_TOL, preserve_topology=True
         )
+        print("SUM long_km:", gdf["long_km"].sum())
+
 
     # puntos HIT / SITIO
     gdf_hit = load_points_from_zip(PUNTOS_ZIP, HIT_NAME)

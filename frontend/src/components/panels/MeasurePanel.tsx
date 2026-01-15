@@ -11,7 +11,7 @@ export function MeasurePanel({ points, result, onReset }: Props) {
   return (
     <div
       style={{
-        background: "white",
+        background: "black",
         padding: "0.5rem 0.75rem",
         borderRadius: 8,
         boxShadow: "0 0 8px rgba(0,0,0,0.15)",
