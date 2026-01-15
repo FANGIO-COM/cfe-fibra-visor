@@ -32,7 +32,7 @@ export function FilterPanel({
   };
 
   return (
-    <div className="bg-white/90 shadow rounded-lg p-3 text-sm min-w-[220px] space-y-2">
+    <div className="bg-black/90 shadow rounded-lg p-3 text-sm min-w-[220px] space-y-2">
       <h2 className="font-semibold mb-1">Filtros</h2>
 
       <div className="flex flex-col">

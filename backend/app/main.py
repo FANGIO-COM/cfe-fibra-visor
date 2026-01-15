@@ -8,6 +8,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from .data_loader import load_base_data
 from .kpi import build_kpis
 
+app = FastAPI()
+
+@app.get("/")
+def root():
+    return {"status": "ok", "message": "API running"}
+
 app = FastAPI(
     title="API Visor Fibra RA",
     version="1.0.0",
