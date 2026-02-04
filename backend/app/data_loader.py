@@ -1,65 +1,34 @@
 # backend/app/data_loader.py
 import os
 import zipfile
-import math
-
-import geopandas as gpd
-import pandas as pd
-from pyproj import Geod
 import tempfile
 import uuid
+import json
 import shutil
+from pathlib import Path
+from os import PathLike
+from typing import Union, Optional
 
-from .config import (
-    FIBRA_SHP,
-    PUNTOS_ZIP,
-    HIT_NAME,
-    SITIO_NAME,
-    CAND_ESTADO,
-    CAND_TEC,
-    CAND_ZONA,
-    CAND_ID,
-    CAND_ORIGEN,
-    ESTADO_MAP,
-    SIMPLIFY_TOL,
-)
+import geopandas as gpd
 
 # =====================
-# Helpers (copiados y adaptados de visor_fibra.py)
+# Helpers
 # =====================
 
+Pathish = Union[str, PathLike]
 
-def find_col(cols, candidates):
-    """
-    Devuelve el nombre real de la primera columna de `cols` que coincida
-    (ignorando mayúsculas/minúsculas) con alguno de los nombres en `candidates`.
-    """
-    low = {c.lower(): c for c in cols}
-    for c in candidates:
-        if c and c.lower() in low:
-            return low[c.lower()]
-    return None
-
-
-def normalize_estado(series):
-    """
-    Normaliza el campo de estado usando ESTADO_MAP y unifica variantes como
-    'en obra' / 'en-obra' -> 'en_obra'.
-    """
-    s = series.astype(str).str.strip().str.lower()
-    s = s.map(lambda v: ESTADO_MAP.get(v, v))
-    return s.replace({"en obra": "en_obra", "en-obra": "en_obra"})
+SUPPORTED_GEOJSON_EXT = {".geojson", ".json"}
+SUPPORTED_ZIP_EXT = {".zip"}
 
 
 def to_wgs84(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     """
-    Reproyecta un GeoDataFrame a WGS84 (EPSG:4326).
+    Reproject GeoDataFrame to WGS84 (EPSG:4326).
 
-    Si el GeoDataFrame no trae CRS:
-      - Toma una geometría de ejemplo.
-      - Si |x| <= 180 y |y| <= 90, asume que ya está en lon/lat (EPSG:4326).
-      - En caso contrario, asume coordenadas en metros tipo WebMercator (EPSG:3857).
-    Si ya trae CRS, lo respeta y solo hace to_crs(4326).
+    If CRS is missing:
+      - Inspect first non-empty geometry coordinate
+      - If it looks like lon/lat -> assume EPSG:4326
+      - Else assume WebMercator meters -> EPSG:3857
     """
     if gdf.crs is None:
         sample = next(
@@ -70,123 +39,131 @@ def to_wgs84(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
             coords = list(sample.coords)
             if coords:
                 x0, y0 = float(coords[0][0]), float(coords[0][1])
-                # ¿Parece lon/lat en grados?
                 if abs(x0) <= 180 and abs(y0) <= 90:
                     gdf = gdf.set_crs(epsg=4326)
                 else:
-                    # Asumimos métrico tipo WebMercator; si usas otro CRS,
-                    # cámbialo aquí.
                     gdf = gdf.set_crs(epsg=3857)
         else:
-            # Sin geometrías válidas, asumimos WGS84 por defecto
             gdf = gdf.set_crs(epsg=4326)
 
-    # Si ya tenía CRS definido, simplemente lo reproyectamos
     return gdf.to_crs(epsg=4326)
 
 
-def km_lengths(gdf):
-    """
-    Calcula la longitud en km de cada geometría sin depender de .length ni de CRS.
+def _find_first_shp(extract_dir: str) -> Optional[str]:
+    """Find first .shp anywhere under extract_dir."""
+    for root, _, files in os.walk(extract_dir):
+        for fn in files:
+            if fn.lower().endswith(".shp"):
+                return os.path.join(root, fn)
+    return None
 
-    - Soporta coordenadas 2D, 3D o 4D (x, y, z, m).
-    - Si las coordenadas parecen grados (lon/lat), usa cálculo geodésico WGS84.
-    - Si NO parecen grados, asume que las unidades son metros y usa distancia euclidiana.
-    """
 
+# =====================
+# Upload loaders
+# =====================
+
+def load_gdf_from_geojson_file(file_path: Pathish) -> gpd.GeoDataFrame:
+    """
+    Robust GeoJSON loader:
+    - Tries geopandas.read_file first
+    - Falls back to manual JSON parsing if needed
+    - Handles UTF-8 BOM
+    """
+    file_path = os.fspath(file_path)
+
+    # 1) Try Fiona/GeoPandas first
+    try:
+        gdf = gpd.read_file(file_path)
+        if gdf.crs is None:
+            gdf = gdf.set_crs(epsg=4326)
+        return to_wgs84(gdf)
+    except Exception:
+        pass
+
+    # 2) Manual fallback
+    with open(file_path, "rb") as f:
+        raw = f.read()
+
+    try:
+        text = raw.decode("utf-8-sig")  # handles UTF-8 BOM
+    except UnicodeDecodeError:
+        text = raw.decode("latin-1")
+
+    try:
+        obj = json.loads(text)
+    except Exception as e:
+        raise ValueError(f"Invalid JSON/GeoJSON: {e}")
+
+    # Normalize to FeatureCollection
+    if isinstance(obj, dict) and obj.get("type") == "Feature":
+        obj = {"type": "FeatureCollection", "features": [obj]}
+    elif not (isinstance(obj, dict) and obj.get("type") == "FeatureCollection"):
+        raise ValueError("GeoJSON must be FeatureCollection or Feature")
+
+    features = obj.get("features") or []
+    if not isinstance(features, list):
+        raise ValueError("GeoJSON 'features' must be a list")
+
+    # Remove features with null geometry
+    features = [f for f in features if isinstance(f, dict) and f.get("geometry")]
+
+    gdf = gpd.GeoDataFrame.from_features(features)
     if gdf.crs is None:
-        gdf = gdf.set_crs(epsg=3857)  # tu data real viene en 3857
+        gdf = gdf.set_crs(epsg=4326)
 
-    g4326 = gdf.to_crs(epsg=4326)
-    crs_metric = g4326.estimate_utm_crs()
-    gm = g4326.to_crs(crs_metric)
-
-    return (gm.length / 1000.0).round(3)
-
-def load_points_from_zip(zip_path, base_name):
-    """
-    Extrae un shapefile desde un ZIP en una carpeta TEMP única (evita locks/permissions)
-    y lo devuelve reproyectado a WGS84.
-    """
-    if not os.path.exists(zip_path):
-        return None
-
-    # Extract into a NEW unique temp directory every run
-    extract_dir = os.path.join(
-        tempfile.gettempdir(),
-        f"{os.path.splitext(os.path.basename(zip_path))[0]}_{uuid.uuid4().hex}"
-    )
-    os.makedirs(extract_dir, exist_ok=True)
-
-    with zipfile.ZipFile(zip_path, "r") as z:
-        z.extractall(extract_dir)
-
-    shp = os.path.join(extract_dir, base_name + ".shp")
-    if not os.path.exists(shp):
-        return None
-
-    gdf = gpd.read_file(shp)
     return to_wgs84(gdf)
 
 
-# =====================
-# Carga principal (equivalente a la parte inicial de main())
-# =====================
-
-
-def load_base_data():
+def load_gdf_from_shapefile_zip(zip_path: Pathish) -> gpd.GeoDataFrame:
     """
-    Carga la fibra, calcula campos, pasa a WGS84 y carga HIT/SITIO.
-
-    Devuelve:
-      - gdf_fibra_wgs (GeoDataFrame en WGS84)
-      - gdf_hit (GeoDataFrame o None)
-      - gdf_sitio (GeoDataFrame o None)
+    Extract shapefile zip into a unique temp folder, load the first .shp found,
+    and return it projected to WGS84. Cleans up temp folder afterwards.
     """
-    if not os.path.exists(FIBRA_SHP):
-        raise FileNotFoundError(f"No se encontró {FIBRA_SHP}")
+    zip_path = os.fspath(zip_path)
 
-    gdf = gpd.read_file(FIBRA_SHP)
-    if gdf.crs is None:
-        gdf = gdf.set_crs(epsg=3857)
+    if not os.path.exists(zip_path):
+        raise FileNotFoundError(zip_path)
 
-    # En este punto NO tocamos gdf.crs; km_lengths se encarga de decidir
-    # si trata las coords como grados o como metros.
-
-    # columnas
-    estado_col = find_col(gdf.columns, CAND_ESTADO)
-    tec_col = find_col(gdf.columns, CAND_TEC)
-    zona_col = find_col(gdf.columns, CAND_ZONA)
-    id_col = find_col(gdf.columns, CAND_ID)
-    origen_col = find_col(gdf.columns, CAND_ORIGEN)
-
-    # longitudes y atributos normalizados
-    gdf["long_km"] = km_lengths(gdf)
-    print("Ejemplo long_km:")
-    print(gdf[["long_km"]].head())
-
-
-    gdf["estado"] = (
-        normalize_estado(gdf[estado_col]) if estado_col else "construido"
+    extract_dir = os.path.join(
+        tempfile.gettempdir(),
+        f"upload_{Path(zip_path).stem}_{uuid.uuid4().hex}",
     )
-    gdf["tec"] = gdf[tec_col] if tec_col else None
-    gdf["zona"] = gdf[zona_col] if zona_col else None
-    gdf["id"] = gdf[id_col] if id_col else None
-    gdf["origen"] = gdf[origen_col] if origen_col else None
-    gdf["dataset"] = "RA - RUTAS RENAyA"
+    os.makedirs(extract_dir, exist_ok=True)
 
-    # Ahora sí, llevamos todo a WGS84 para el mapa/API
+    try:
+        with zipfile.ZipFile(zip_path, "r") as z:
+            z.extractall(extract_dir)
+
+        shp_path = _find_first_shp(extract_dir)
+        if not shp_path:
+            raise ValueError("ZIP does not contain any .shp file")
+
+        gdf = gpd.read_file(shp_path)
+        return to_wgs84(gdf)
+
+    finally:
+        shutil.rmtree(extract_dir, ignore_errors=True)
+
+
+def load_gdf_from_upload(file_path: Pathish, filename: str) -> gpd.GeoDataFrame:
+    """
+    Single entry point: detect format and return GeoDataFrame in WGS84.
+    """
+    file_path = os.fspath(file_path)
+    ext = Path(filename).suffix.lower()
+
+    if ext in SUPPORTED_GEOJSON_EXT:
+        return load_gdf_from_geojson_file(file_path)
+
+    if ext in SUPPORTED_ZIP_EXT:
+        return load_gdf_from_shapefile_zip(file_path)
+
+    raise ValueError("Unsupported file type. Use .geojson/.json or shapefile .zip")
+
+
+def gdf_to_featurecollection(gdf: gpd.GeoDataFrame) -> dict:
+    """
+    Convert GeoDataFrame to GeoJSON FeatureCollection dict (WGS84).
+    """
     gdf_wgs = to_wgs84(gdf)
-
-    if SIMPLIFY_TOL > 0:
-        gdf_wgs["geometry"] = gdf_wgs.geometry.simplify(
-            SIMPLIFY_TOL, preserve_topology=True
-        )
-        print("SUM long_km:", gdf["long_km"].sum())
-
-
-    # puntos HIT / SITIO
-    gdf_hit = load_points_from_zip(PUNTOS_ZIP, HIT_NAME)
-    gdf_sitio = load_points_from_zip(PUNTOS_ZIP, SITIO_NAME)
-
-    return gdf_wgs, gdf_hit, gdf_sitio
+    return json.loads(gdf_wgs.to_json(drop_id=True))

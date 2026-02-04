@@ -1,6 +1,6 @@
 // src/components/layers/FibraLayer.tsx
 import { GeoJSON } from "react-leaflet";
-import type { Feature, FeatureCollection } from "geojson";
+import type { Feature, FeatureCollection, Geometry, GeoJsonProperties } from "geojson";
 import type { Filtros } from "../../hooks/useFibraData";
 import L from "leaflet";
 
@@ -25,10 +25,7 @@ export function FibraLayer({
     features: fibra.features.filter((f: Feature) => {
       const p: any = f.properties ?? {};
 
-      if (
-        filtros.estado &&
-        String(p.estado).toLowerCase() !== filtros.estado
-      ) {
+      if (filtros.estado && String(p.estado).toLowerCase() !== filtros.estado) {
         return false;
       }
       if (filtros.tec && String(p.tec) !== filtros.tec) {
@@ -75,7 +72,12 @@ export function FibraLayer({
     };
   };
 
-  const styleFn = (feature: Feature): L.PathOptions => {
+  // ✅ FIX: feature puede llegar como undefined según los tipos de react-leaflet
+  const styleFn = (
+    feature?: Feature<Geometry, GeoJsonProperties>
+  ): L.PathOptions => {
+    if (!feature) return {};
+
     const p: any = feature.properties ?? {};
     const est = String(p.estado ?? "").toLowerCase();
     const dash = DASH_BY_STATE[est];

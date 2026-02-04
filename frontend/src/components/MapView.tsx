@@ -1,31 +1,32 @@
 // src/components/MapView.tsx
-import { useState, useEffect } from "react";
+import { useEffect, useState } from "react";
 import {
   MapContainer,
   TileLayer,
   LayersControl,
-  GeoJSON,
   ScaleControl,
   useMap,
 } from "react-leaflet";
+import type { LatLngExpression, ControlPosition } from "leaflet";
 import L from "leaflet";
+import type { FeatureCollection } from "geojson";
 
-import { useFibraData } from "../hooks/useFibraData";
-import { FibraLayer } from "./layers/FibraLayer";
-import { PointsLayer } from "./layers/PointsLayer";
-import { KpiPanel } from "./panels/KpiPanel";
-import { FilterPanel } from "./panels/FilterPanel";
-import { LegendPanel } from "./panels/LegendPanel";
-import { MeasurePanel } from "./panels/MeasurePanel";
+import { UploadPanel } from "./panels/UploadPanel";
 import type { MeasurePoints, MeasureResult } from "../utils/measureFibra";
 import { computeMeasure } from "../utils/measureFibra";
 
 const { BaseLayer, Overlay } = LayersControl;
 
+const INITIAL_CENTER: LatLngExpression = [20.5, -103.5];
+const POS_BOTTOM_LEFT: ControlPosition = "bottomleft";
+const POS_TOP_RIGHT: ControlPosition = "topright";
+
+// Change if needed
+const API_BASE_URL = "http://127.0.0.1:8000";
+
 // =====================
 // Control de pantalla completa
 // =====================
-
 const FullScreenControl = () => {
   const map = useMap();
   const [isFs, setIsFs] = useState(false);
@@ -58,9 +59,7 @@ const FullScreenControl = () => {
             e.preventDefault();
             toggleFs();
           }}
-          title={
-            isFs ? "Salir de pantalla completa" : "Ver en pantalla completa"
-          }
+          title={isFs ? "Salir de pantalla completa" : "Ver en pantalla completa"}
           style={{
             textAlign: "center",
             width: 32,
@@ -78,7 +77,6 @@ const FullScreenControl = () => {
 // =====================
 // Minimap
 // =====================
-
 const MiniMapControl = () => {
   const map = useMap();
   const divId = "mini-map-container";
@@ -121,7 +119,7 @@ const MiniMapControl = () => {
       map.off("zoom", sync);
       miniMap?.remove();
     };
-  }, [map, divId]);
+  }, [map]);
 
   return (
     <div className="leaflet-bottom leaflet-right">
@@ -141,18 +139,53 @@ const MiniMapControl = () => {
 };
 
 // =====================
-// Mapa principal
+// Leaflet-based GeoJSON layer
 // =====================
+function StyledGeoJsonLayer({
+  data,
+  style,
+  onEachFeature,
+}: {
+  data: any;
+  style?: L.PathOptions;
+  onEachFeature?: (feature: any, layer: L.Layer) => void;
+}) {
+  const map = useMap();
 
+  useEffect(() => {
+    if (!data) return;
+
+    const layer = L.geoJSON(data, {
+      style,
+      onEachFeature,
+      pointToLayer: (_feature, latlng) =>
+        L.circleMarker(latlng, { radius: 6, weight: 2, opacity: 0.9 }),
+    });
+
+    layer.addTo(map);
+
+    return () => {
+      layer.remove();
+    };
+  }, [map, data, style, onEachFeature]);
+
+  return null;
+}
+
+// =====================
+// Mapa principal (UPLOAD-ONLY)
+// =====================
 export function MapView() {
-  const { fibra, hits, sitios, kpis, filtros, setFiltros, loading, error } =
-    useFibraData();
+  // Upload-only datasets
+  const [fibra, setFibra] = useState<FeatureCollection | null>(null);
+  const [hits, setHits] = useState<FeatureCollection | null>(null);
+  const [sitios, setSitios] = useState<FeatureCollection | null>(null);
 
+  // Measurement
   const [measurePoints, setMeasurePoints] = useState<MeasurePoints>({});
-  const [measureResult, setMeasureResult] =
-    useState<MeasureResult | null>(null);
+  const [measureResult, setMeasureResult] = useState<MeasureResult | null>(null);
 
-  // Siempre que cambien los puntos de medición o la fibra, recalculamos
+  // Recompute measure when fibra or points change
   useEffect(() => {
     if (!fibra) {
       setMeasureResult(null);
@@ -162,163 +195,175 @@ export function MapView() {
     setMeasureResult(res);
   }, [fibra, measurePoints]);
 
-  if (loading) {
-    return <div style={{ padding: "1rem" }}>Cargando datos del mapa…</div>;
-  }
-
-  if (error || !fibra) {
-    return (
-      <div style={{ padding: "1rem", color: "red" }}>
-        Error cargando datos: {error ?? "sin detalles"}
-      </div>
-    );
-  }
-
-  const handleResetMeasure = () => {
-    setMeasurePoints({});
-  };
+  const handleResetMeasure = () => setMeasurePoints({});
 
   const handleHitClick = (lat: number, lng: number) => {
-    // IMPORTANTE: actualización funcional → no perdemos division/final
-    setMeasurePoints((prev) => ({
-      ...prev,
-      hit: [lat, lng],
-    }));
+    setMeasurePoints((prev) => ({ ...prev, hit: [lat, lng] }));
   };
 
   const handleSitioClick = (lat: number, lng: number) => {
     setMeasurePoints((prev) => {
-      // Si no hay división, este click es la división
-      if (!prev.division) {
-        return {
-          ...prev,
-          division: [lat, lng],
-        };
-      }
-      // Si ya hay división, este click es el final
-      return {
-        ...prev,
-        final: [lat, lng],
-      };
+      if (!prev.division) return { ...prev, division: [lat, lng] };
+      return { ...prev, final: [lat, lng] };
+    });
+  };
+
+  // Click handlers for uploaded point layers
+  const onEachHit = (_feature: any, layer: L.Layer) => {
+    layer.on("click", (e: any) => {
+      const { lat, lng } = e.latlng;
+      handleHitClick(lat, lng);
+    });
+  };
+
+  const onEachSitio = (_feature: any, layer: L.Layer) => {
+    layer.on("click", (e: any) => {
+      const { lat, lng } = e.latlng;
+      handleSitioClick(lat, lng);
     });
   };
 
   return (
-    <div
-      style={{
-        width: "100%",
-        height: "100%",
-        position: "relative",
-      }}
-    >
-      <MapContainer
-        center={[20.5, -103.5]}
-        zoom={8}
-        scrollWheelZoom
-        style={{ width: "100%", height: "100%" }}
-      >
-        <ScaleControl position="bottomleft" />
+    <div style={{ width: "100%", height: "100%", position: "relative" }}>
+      <MapContainer center={INITIAL_CENTER} zoom={8} scrollWheelZoom style={{ width: "100%", height: "100%" }}>
+        <ScaleControl position={POS_BOTTOM_LEFT} />
         <FullScreenControl />
         <MiniMapControl />
 
-        <LayersControl position="topright">
-          {/* Mapas base */}
+        <LayersControl position={POS_TOP_RIGHT}>
+          {/* Base maps */}
           <BaseLayer checked name="OpenStreetMap">
-            <TileLayer
-              attribution="&copy; OpenStreetMap contributors"
-              url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-            />
+            <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
           </BaseLayer>
 
           <BaseLayer name="CartoDB Positron">
-            <TileLayer
-              attribution="&copy; OpenStreetMap contributors &copy; CARTO"
-              url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png"
-            />
+            <TileLayer url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png" />
           </BaseLayer>
 
           <BaseLayer name="Esri World Imagery">
-            <TileLayer
-              attribution="Tiles &copy; Esri"
-              url="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
-            />
+            <TileLayer url="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}" />
           </BaseLayer>
 
-          {/* Overlays */}
-          <Overlay checked name="Fibra RA">
-            <FibraLayer fibra={fibra} filtros={filtros} />
-          </Overlay>
+          {/* Uploaded layers */}
+          {fibra && (
+            <Overlay checked name="Fibra (uploaded)">
+              <StyledGeoJsonLayer data={fibra as any} style={{ weight: 3, opacity: 0.9 }} />
+            </Overlay>
+          )}
 
-          <Overlay checked name="HIT + Sitios">
-            <PointsLayer
-              hits={hits}
-              sitios={sitios}
-              onHitClick={handleHitClick}
-              onSitioClick={handleSitioClick}
-            />
-          </Overlay>
-
-          {/* Trazado de medición */}
-          {measureResult?.segHitDiv && (
-            <Overlay checked name="Tramo HIT→División">
-              <GeoJSON
-                data={measureResult.segHitDiv as any}
-                style={{ color: "#1abc9c", weight: 6, opacity: 0.9 }}
+          {hits && (
+            <Overlay checked name="HIT (uploaded)">
+              <StyledGeoJsonLayer
+                data={hits as any}
+                style={{ weight: 2, opacity: 0.9 }}
+                onEachFeature={onEachHit}
               />
             </Overlay>
           )}
+
+          {sitios && (
+            <Overlay checked name="Sitios (uploaded)">
+              <StyledGeoJsonLayer
+                data={sitios as any}
+                style={{ weight: 2, opacity: 0.9 }}
+                onEachFeature={onEachSitio}
+              />
+            </Overlay>
+          )}
+
+          {/* Measurement segments */}
+          {measureResult?.segHitDiv && (
+            <Overlay checked name="Tramo HIT→División">
+              <StyledGeoJsonLayer data={measureResult.segHitDiv as any} style={{ weight: 6, opacity: 0.9 }} />
+            </Overlay>
+          )}
+
           {measureResult?.segDivFin && (
             <Overlay checked name="Tramo División→Final">
-              <GeoJSON
-                data={measureResult.segDivFin as any}
-                style={{ color: "#e67e22", weight: 6, opacity: 0.9 }}
-              />
+              <StyledGeoJsonLayer data={measureResult.segDivFin as any} style={{ weight: 6, opacity: 0.9 }} />
             </Overlay>
           )}
         </LayersControl>
       </MapContainer>
 
-      {/* Panel KPIs */}
-      <div
-        style={{
-          position: "absolute",
-          top: 16,
-          left: 50,
-          zIndex: 1000,
-        }}
-      >
-        {kpis && <KpiPanel kpis={kpis} />}
-      </div>
+      {/* Upload panel */}
+      <div style={{ position: "absolute", top: 16, left: 16, zIndex: 1000, display: "flex", gap: 12 }}>
+        <UploadPanel
+          apiBaseUrl={API_BASE_URL}
+          onLayerLoaded={(geojson, info) => {
+            // Basic heuristic: decide where to store it
+            // You can improve this by adding a dropdown (fibra/hits/sitios) in the UploadPanel.
+            const features = geojson.features ?? [];
+            const geomType = features[0]?.geometry?.type;
 
-      {/* Panel filtros + medición */}
-      <div
-        style={{
-          position: "absolute",
-          top: 160,
-          right: 20,
-          zIndex: 1000,
-        }}
-      >
-        <div style={{ marginBottom: 8 }}>
-          <FilterPanel fibra={fibra} filtros={filtros} onChange={setFiltros} />
-        </div>
-        <MeasurePanel
-          points={measurePoints}
-          result={measureResult}
-          onReset={handleResetMeasure}
+            if (geomType === "LineString" || geomType === "MultiLineString") {
+              setFibra(geojson as any);
+            } else if (geomType === "Point" || geomType === "MultiPoint") {
+              // If hits not set yet -> set hits, else set sitios
+              if (!hits) setHits(geojson as any);
+              else setSitios(geojson as any);
+            } else {
+              // Default: treat as fibra-ish
+              setFibra(geojson as any);
+            }
+          }}
         />
-      </div>
 
-      {/* Leyenda */}
-      <div
-        style={{
-          position: "absolute",
-          bottom: 50,
-          left: 16,
-          zIndex: 1000,
-        }}
-      >
-        <LegendPanel />
+        <div
+          style={{
+            width: 260,
+            padding: 12,
+            borderRadius: 12,
+            background: "rgba(15,15,15,0.92)",
+            color: "white",
+            border: "1px solid rgba(255,255,255,0.08)",
+          }}
+        >
+          <div style={{ fontWeight: 700, marginBottom: 6 }}>Upload-only mode</div>
+          <div style={{ fontSize: 12, opacity: 0.8, lineHeight: 1.35 }}>
+            1) Upload fibra (lines). <br />
+            2) Upload HIT points. <br />
+            3) Upload Sitios points. <br />
+            Click HIT/Sitio points to set measurement points.
+          </div>
+
+          <button
+            onClick={() => {
+              setFibra(null);
+              setHits(null);
+              setSitios(null);
+              setMeasurePoints({});
+            }}
+            style={{
+              marginTop: 10,
+              width: "100%",
+              padding: "8px 10px",
+              borderRadius: 10,
+              border: "1px solid rgba(255,255,255,0.10)",
+              background: "rgba(255,255,255,0.08)",
+              color: "white",
+              cursor: "pointer",
+            }}
+          >
+            Clear uploaded data
+          </button>
+
+          <button
+            onClick={handleResetMeasure}
+            style={{
+              marginTop: 8,
+              width: "100%",
+              padding: "8px 10px",
+              borderRadius: 10,
+              border: "1px solid rgba(255,255,255,0.10)",
+              background: "rgba(255,255,255,0.08)",
+              color: "white",
+              cursor: "pointer",
+            }}
+          >
+            Reset measure points
+          </button>
+        </div>
       </div>
     </div>
   );
